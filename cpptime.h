@@ -41,18 +41,13 @@
  * This component can be used to manage a set of timeouts. It is implemented in
  * pure C++11. It is therefore very portable given a compliant compiler.
  *
- * A timeout can be added with one of the `add()` functions, and removed with
- * the `remove()` function. A timeout can be set to be either one-shot or
- * periodic. If it is one-shot, the callback is invoked once and the timeout
- * event is then automatically removed. If the timeout is periodic, it is
- * always renewed and never automatically removed.
+ * A timeout can be added with one of the `add` functions, and removed with the
+ * `remove` function. A timeout can be either one-shot or periodic. In case a
+ * timeout is one-shot, the callback is invoked once and the timeout event is
+ * then automatically removed. If the timer is periodic, it is never
+ * automatically removed, but always renewed.
  *
- * When a timeout is removed or when a one-shot timeout expires, the handler
- * will be deleted to clean-up any resources.
- *
- * Removing a timeout is possible from within the callback. In this case, you
- * must be careful not to access any captured variables, if any, after calling
- * `remove()`, because they are no longer valid.
+ * Removing a timeout is possible even from within the callback.
  *
  * Timeout Units
  * -------------
@@ -97,20 +92,148 @@
  */
 
 // Includes
-#include <algorithm>
-#include <chrono>
-#include <condition_variable>
 #include <functional>
-#include <mutex>
-#include <set>
-#include <stack>
 #include <thread>
+#include <mutex>
+#include <chrono>
+#include <algorithm>
 #include <vector>
+#include <stack>
+#include <set>
+
+
+#ifdef __GNUC__
+#if  __GNUC__ < 10
+
+#include <cstdlib>
+#include <pthread.h>
+#include <bits/types/struct_timespec.h>
+namespace CppTime {
+	
+enum class cv_status { no_timeout, timeout };
+
+class condition_variable_fixd_gcc_less10 {
+	typedef std::chrono::steady_clock __clock_t;
+    typedef pthread_cond_t		__native_type;
+    __native_type _M_cond = PTHREAD_COND_INITIALIZER;
+	pthread_condattr_t attr_;
+	
+
+  public:
+    typedef __native_type* 		native_handle_type;
+
+    condition_variable_fixd_gcc_less10() noexcept{
+		pthread_condattr_init(&attr_);
+		pthread_condattr_setclock(&attr_, CLOCK_MONOTONIC);
+		pthread_cond_init(&_M_cond, &attr_);
+	};
+    ~condition_variable_fixd_gcc_less10() noexcept {
+		pthread_condattr_destroy(&attr_);
+		pthread_cond_destroy(&_M_cond);
+	};
+    condition_variable_fixd_gcc_less10(const condition_variable_fixd_gcc_less10&) = delete;
+    condition_variable_fixd_gcc_less10& operator=(const condition_variable_fixd_gcc_less10&) = delete;
+
+    void notify_one() noexcept {
+		pthread_cond_signal(&_M_cond);
+	}
+
+    void notify_all() noexcept {
+		pthread_cond_broadcast(&_M_cond);
+	}
+
+    void wait(std::unique_lock<std::mutex>& __lock) noexcept {
+    	pthread_cond_wait(&_M_cond, __lock.mutex()->native_handle());
+	}
+
+    template<typename _Predicate>
+    void wait(std::unique_lock<std::mutex>& __lock, _Predicate __p) {
+		while (!__p()) {
+			wait(__lock);
+		}
+    }
+
+    template<typename _Duration>
+    cv_status wait_until(std::unique_lock<std::mutex>& __lock, const std::chrono::time_point<__clock_t, _Duration>& __atime) { 
+		return __wait_until_impl(__lock, __atime); 
+	}
+
+    template<typename _Clock, typename _Duration>
+    cv_status wait_until(std::unique_lock<std::mutex>& __lock, const std::chrono::time_point<_Clock, _Duration>& __atime) {
+		// DR 887 - Sync unknown clock to known clock.
+		const typename _Clock::time_point __c_entry = _Clock::now();
+		const __clock_t::time_point __s_entry = __clock_t::now();
+		const auto __delta = __atime - __c_entry;
+		const auto __s_atime = __s_entry + __delta;
+
+		return __wait_until_impl(__lock, __s_atime);
+    }
+
+    template<typename _Clock, typename _Duration, typename _Predicate>
+    bool wait_until(std::unique_lock<std::mutex>& __lock, const std::chrono::time_point<_Clock, _Duration>& __atime, _Predicate __p) {
+		while (!__p()){
+	  		if (wait_until(__lock, __atime) == cv_status::timeout) {
+				return __p();
+			}
+		}
+
+		return true;
+    }
+
+    template<typename _Rep, typename _Period>
+    cv_status wait_for(std::unique_lock<std::mutex>& __lock, const std::chrono::duration<_Rep, _Period>& __rtime) { 
+		return wait_until(__lock, __clock_t::now() + __rtime); 
+	}
+
+    template<typename _Rep, typename _Period, typename _Predicate>
+    bool wait_for(std::unique_lock<std::mutex>& __lock, const std::chrono::duration<_Rep, _Period>& __rtime, _Predicate __p) { 
+		return wait_until(__lock, __clock_t::now() + __rtime, std::move(__p)); 
+	}
+
+    native_handle_type native_handle() { 
+		return &_M_cond; 
+	}
+
+  private:
+    template<typename _Dur>
+    cv_status __wait_until_impl(std::unique_lock<std::mutex>& __lock, const std::chrono::time_point<__clock_t, _Dur>& __atime) {
+		auto __s = std::chrono::time_point_cast<std::chrono::seconds>(__atime);
+		auto __ns = std::chrono::duration_cast<std::chrono::nanoseconds>(__atime - __s);
+
+		timespec __ts = {
+	    	static_cast<std::time_t>(__s.time_since_epoch().count()),
+	    	static_cast<long>(__ns.count())
+		};
+
+		pthread_cond_timedwait(&_M_cond, __lock.mutex()->native_handle(), &__ts);
+
+		return (__clock_t::now() < __atime ? cv_status::no_timeout : cv_status::timeout);
+      }
+};
+
+} //namespace
+
+#else
+#include <condition_variable>
+#endif
+#else
+#include <condition_variable>
+#endif
 
 namespace CppTime
 {
 
 // Public types
+#ifdef __GNUC__
+#if  __GNUC__ < 10 
+using condition_variable_t = condition_variable_fixd_gcc_less10;
+#else 
+using condition_variable_t = std::condition_variable;
+#endif
+#else
+using condition_variable_t = std::condition_variable;
+#endif 
+
 using timer_id = std::size_t;
 using handler_t = std::function<void(timer_id)>;
 using clock = std::chrono::steady_clock;
@@ -163,7 +286,7 @@ class Timer
 
 	// Thread and locking variables.
 	std::mutex m;
-	std::condition_variable cond;
+	condition_variable_t cond;
 	std::thread worker;
 
 	// Use to terminate the timer thread.
@@ -182,7 +305,7 @@ public:
 	{
 		scoped_m lock(m);
 		done = false;
-		worker = std::thread([this] { run(); });
+		worker = std::thread([this]{ run(); });
 	}
 
 	~Timer()
@@ -260,7 +383,6 @@ public:
 			return false;
 		}
 		events[id].valid = false;
-		events[id].handler = nullptr;
 		auto it = std::find_if(time_events.begin(), time_events.end(),
 		    [&](const detail::Time_event &te) { return te.ref == id; });
 		if(it != time_events.end()) {
@@ -302,7 +424,6 @@ private:
 						// The event is either no longer valid because it was removed in the
 						// callback, or it is a one-shot timer.
 						events[te.ref].valid = false;
-						events[te.ref].handler = nullptr;
 						free_ids.push(te.ref);
 					}
 				} else {
